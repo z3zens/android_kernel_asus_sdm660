@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2019 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2020 The Linux Foundation. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
@@ -320,9 +320,18 @@ void lim_add_pre_auth_node(tpAniSirGlobal pMac, struct tLimPreAuthNode *pAuthNod
 void lim_release_pre_auth_node(tpAniSirGlobal pMac, tpLimPreAuthNode pAuthNode)
 {
 	pAuthNode->fFree = 1;
-	MTRACE(mac_trace
-		       (pMac, TRACE_CODE_TIMER_DEACTIVATE, NO_SESSION,
-		       eLIM_PRE_AUTH_CLEANUP_TIMER));
+	if (pAuthNode->authType == eSIR_AUTH_TYPE_SAE &&
+	    pAuthNode->assoc_req.present) {
+		tpSirAssocReq assoc =
+			 (tpSirAssocReq)pAuthNode->assoc_req.assoc_req;
+
+		if (assoc->assocReqFrameLength)
+			qdf_mem_free(assoc->assocReqFrame);
+		qdf_mem_free(assoc);
+		pAuthNode->assoc_req.present = false;
+	}
+	MTRACE(mac_trace(pMac, TRACE_CODE_TIMER_DEACTIVATE, NO_SESSION,
+			 eLIM_PRE_AUTH_CLEANUP_TIMER));
 	tx_timer_deactivate(&pAuthNode->timer);
 	pMac->lim.gLimNumPreAuthContexts--;
 } /*** end lim_release_pre_auth_node() ***/
@@ -854,6 +863,8 @@ void lim_send_set_bss_key_req(tpAniSirGlobal pMac,
 
 		/* Respond to SME with LIM_MLM_SETKEYS_CNF */
 		mlmSetKeysCnf.resultCode = eSIR_SME_HAL_SEND_MESSAGE_FAIL;
+		qdf_mem_zero(pSetBssKeyParams, sizeof(tSetBssKeyParams));
+		qdf_mem_free(pSetBssKeyParams);
 	} else
 		return;         /* Continue after WMA_SET_BSSKEY_RSP... */
 
