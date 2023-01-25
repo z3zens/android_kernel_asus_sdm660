@@ -22,6 +22,7 @@
 #include <linux/qpnp/qpnp-revid.h>
 #include "fg-core.h"
 #include "fg-reg.h"
+#include <linux/qpnp/qpnp-adc.h>
 
 #define FG_GEN3_DEV_NAME	"qcom,fg-gen3"
 
@@ -636,24 +637,33 @@ static int fg_get_jeita_threshold(struct fg_chip *chip,
 #define BATT_TEMP_DENR		1
 static int fg_get_battery_temp(struct fg_chip *chip, int *val)
 {
-	int rc = 0, temp;
-	u8 buf[2];
+	int rc = 0;
+	int64_t temp;
+	struct qpnp_vadc_result result;
 
-	rc = fg_read(chip, BATT_INFO_BATT_TEMP_LSB(chip), buf, 2);
-	if (rc < 0) {
-		pr_err("failed to read addr=0x%04x, rc=%d\n",
-			BATT_INFO_BATT_TEMP_LSB(chip), rc);
+	chip->vadc_dev = qpnp_get_vadc(chip->dev, "vadc_therm");
+
+	if (IS_ERR(chip->vadc_dev)) {
+		rc = PTR_ERR(chip->vadc_dev);
+		if (rc != -EPROBE_DEFER)
+			pr_err("VADC property: vadc_therm missing\n");
 		return rc;
 	}
 
-	temp = ((buf[1] & BATT_TEMP_MSB_MASK) << 8) |
-		(buf[0] & BATT_TEMP_LSB_MASK);
-	temp = DIV_ROUND_CLOSEST(temp, 4);
 
-	/* Value is in Kelvin; Convert it to deciDegC */
-	temp = (temp - 273) * 10;
-	*val = temp;
-	return 0;
+	rc = qpnp_vadc_read(chip->vadc_dev, VADC_AMUX_THM3_PU2, &result);
+	if (!rc) {
+		temp = result.physical;
+		/* Value is in DegreeC; Convert it to deciDegC.
+		   Also, add an offset of -20 deciDegC, to report
+		   a more probable battery temperature. */
+		temp = (temp * 10) - 20;
+		*val = temp;
+		return rc;
+	} else {
+		pr_err("Unable to read battery_temp\n");
+		return rc;
+	}
 }
 
 static int fg_get_battery_resistance(struct fg_chip *chip, int *val)
@@ -779,8 +789,12 @@ static int fg_get_msoc(struct fg_chip *chip, int *msoc)
 	else if (*msoc == 0)
 		*msoc = 0;
 	else
-		*msoc = DIV_ROUND_CLOSEST((*msoc - 1) * (FULL_CAPACITY - 2),
-				FULL_SOC_RAW - 2) + 1;
+		*msoc = DIV_ROUND_CLOSEST(*msoc * FULL_CAPACITY,
+				FULL_SOC_RAW);
+
+	if (*msoc >= FULL_CAPACITY)
+		*msoc = FULL_CAPACITY;
+
 	return 0;
 }
 
@@ -890,6 +904,11 @@ static int fg_get_prop_capacity(struct fg_chip *chip, int *val)
 	if (chip->battery_missing) {
 		*val = BATT_MISS_SOC;
 		return 0;
+	}
+
+	if (!chip->soc_reporting_ready) {
+		*val = BATT_MISS_SOC;
+		return -EBUSY;
 	}
 
 	if (is_batt_empty(chip)) {
@@ -1212,7 +1231,7 @@ static int fg_awake_cb(struct votable *votable, void *data, int awake,
 	struct fg_chip *chip = data;
 
 	if (awake)
-		pm_stay_awake(chip->dev);
+		pm_wakeup_event(chip->dev, 500);
 	else
 		pm_relax(chip->dev);
 
@@ -1831,7 +1850,9 @@ static int fg_charge_full_update(struct fg_chip *chip)
 		msoc, bsoc, chip->health, chip->charge_status,
 		chip->charge_full);
 	if (chip->charge_done && !chip->charge_full) {
-		if (msoc >= 99 && chip->health == POWER_SUPPLY_HEALTH_GOOD) {
+		if (msoc >= 99 && (chip->health == POWER_SUPPLY_HEALTH_GOOD
+				|| chip->health == POWER_SUPPLY_HEALTH_COOL
+				|| chip->health == POWER_SUPPLY_HEALTH_WARM)) {
 			fg_dbg(chip, FG_STATUS, "Setting charge_full to true\n");
 			chip->charge_full = true;
 			/*
@@ -2105,7 +2126,15 @@ static int fg_adjust_recharge_soc(struct fg_chip *chip)
 				chip->recharge_soc_adjusted = true;
 			} else {
 				/* adjusted already, do nothing */
-				return 0;
+				if (chip->health != POWER_SUPPLY_HEALTH_GOOD)
+					return 0;
+
+				/*
+				 * Device is out of JEITA so restore the
+				 * default value
+				 */
+				new_recharge_soc = recharge_soc;
+				chip->recharge_soc_adjusted = false;
 			}
 		} else {
 			if (!chip->recharge_soc_adjusted)
@@ -3855,9 +3884,6 @@ static int fg_psy_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CC_STEP_SEL:
 		pval->intval = chip->ttf.cc_step.sel;
 		break;
-	case POWER_SUPPLY_PROP_FG_RESET_CLOCK:
-		pval->intval = 0;
-		break;
 	default:
 		pr_err("unsupported property %d\n", psp);
 		rc = -EINVAL;
@@ -3868,100 +3894,6 @@ static int fg_psy_get_property(struct power_supply *psy,
 		return -ENODATA;
 
 	return 0;
-}
-
-#define BCL_RESET_RETRY_COUNT 4
-static int fg_bcl_reset(struct fg_chip *chip)
-{
-	int i, ret, rc = 0;
-	u8 val, peek_mux;
-	bool success = false;
-
-	/* Read initial value of peek mux1 */
-	rc = fg_read(chip, BATT_INFO_PEEK_MUX1(chip), &peek_mux, 1);
-	if (rc < 0) {
-		pr_err("Error in writing peek mux1, rc=%d\n", rc);
-		return rc;
-	}
-
-	val = 0x83;
-	rc = fg_write(chip, BATT_INFO_PEEK_MUX1(chip), &val, 1);
-	if (rc < 0) {
-		pr_err("Error in writing peek mux1, rc=%d\n", rc);
-		return rc;
-	}
-
-	mutex_lock(&chip->sram_rw_lock);
-	for (i = 0; i < BCL_RESET_RETRY_COUNT; i++) {
-		rc = fg_dma_mem_req(chip, true);
-		if (rc < 0) {
-			pr_err("Error in locking memory, rc=%d\n", rc);
-			goto unlock;
-		}
-
-		rc = fg_read(chip, BATT_INFO_RDBACK(chip), &val, 1);
-		if (rc < 0) {
-			pr_err("Error in reading rdback, rc=%d\n", rc);
-			goto release_mem;
-		}
-
-		if (val & PEEK_MUX1_BIT) {
-			rc = fg_masked_write(chip, BATT_SOC_RST_CTRL0(chip),
-						BCL_RESET_BIT, BCL_RESET_BIT);
-			if (rc < 0) {
-				pr_err("Error in writing RST_CTRL0, rc=%d\n",
-						rc);
-				goto release_mem;
-			}
-
-			rc = fg_dma_mem_req(chip, false);
-			if (rc < 0)
-				pr_err("Error in unlocking memory, rc=%d\n",
-						rc);
-
-			/* Delay of 2ms */
-			usleep_range(2000, 3000);
-			ret = fg_masked_write(chip, BATT_SOC_RST_CTRL0(chip),
-						BCL_RESET_BIT, 0);
-			if (ret < 0)
-				pr_err("Error in writing RST_CTRL0, rc=%d\n",
-						rc);
-			if (!rc && !ret)
-				success = true;
-
-			goto unlock;
-		} else {
-			rc = fg_dma_mem_req(chip, false);
-			if (rc < 0) {
-				pr_err("Error in unlocking memory, rc=%d\n",
-						rc);
-				goto unlock;
-			}
-			success = false;
-			pr_err_ratelimited("PEEK_MUX1 not set retrying...\n");
-			msleep(1000);
-		}
-	}
-
-release_mem:
-	rc = fg_dma_mem_req(chip, false);
-	if (rc < 0)
-		pr_err("Error in unlocking memory, rc=%d\n", rc);
-
-unlock:
-	ret = fg_write(chip, BATT_INFO_PEEK_MUX1(chip), &peek_mux, 1);
-	if (ret < 0) {
-		pr_err("Error in writing peek mux1, rc=%d\n", rc);
-		mutex_unlock(&chip->sram_rw_lock);
-		return ret;
-	}
-
-	mutex_unlock(&chip->sram_rw_lock);
-
-	if (!success)
-		return -EAGAIN;
-	else
-		return rc;
 }
 
 static int fg_psy_set_property(struct power_supply *psy,
@@ -4049,13 +3981,6 @@ static int fg_psy_set_property(struct power_supply *psy,
 		rc = fg_set_jeita_threshold(chip, JEITA_HOT, pval->intval);
 		if (rc < 0) {
 			pr_err("Error in writing jeita_hot, rc=%d\n", rc);
-			return rc;
-		}
-		break;
-	case POWER_SUPPLY_PROP_FG_RESET_CLOCK:
-		rc = fg_bcl_reset(chip);
-		if (rc < 0) {
-			pr_err("Error in resetting BCL clock, rc=%d\n", rc);
 			return rc;
 		}
 		break;
@@ -4156,7 +4081,6 @@ static enum power_supply_property fg_psy_props[] = {
 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE,
 	POWER_SUPPLY_PROP_CC_STEP,
 	POWER_SUPPLY_PROP_CC_STEP_SEL,
-	POWER_SUPPLY_PROP_FG_RESET_CLOCK,
 };
 
 static const struct power_supply_desc fg_psy_desc = {
@@ -5155,6 +5079,9 @@ static int fg_parse_dt(struct fg_chip *chip)
 			pr_warn("Error reading Jeita thresholds, default values will be used rc:%d\n",
 				rc);
 	}
+
+	chip->dt.jeita_thresholds[JEITA_WARM] = 97;
+	chip->dt.jeita_thresholds[JEITA_HOT] = 97;
 
 	if (of_property_count_elems_of_size(node,
 		"qcom,battery-thermal-coefficients",
