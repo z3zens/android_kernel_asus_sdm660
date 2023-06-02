@@ -1,0 +1,16 @@
+name: Build Kernel Zenfone Max Pro M2
+on:
+  push:
+    branches:
+      - sc-qpr3
+jobs:
+  kernel-build:
+    runs-on: ubuntu-latest
+    container:
+      image: z3zens/ubuntu:latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: Build Kernel
+      run: |
+        git config --global --add safe.directory /__w/android_kernel_asus_sdm660/android_kernel_asus_sdm660
+        bash kernel.sh
