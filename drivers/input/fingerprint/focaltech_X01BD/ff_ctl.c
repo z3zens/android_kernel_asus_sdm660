@@ -32,6 +32,7 @@
 #include <linux/miscdevice.h>
 #include <linux/fb.h>
 #include <linux/notifier.h>
+#include <linux/pm_wakeup.h>
 
 #ifdef CONFIG_COMPAT
 #include <linux/compat.h>
@@ -62,7 +63,7 @@ typedef struct {
     struct fasync_struct *async_queue;
     struct input_dev *input;
     struct notifier_block fb_notifier;
-    struct wakeup_source wakeup_source;
+    struct wakeup_source *wake_lock;
     bool b_driver_inited;
     bool b_config_dirtied;
 } ff_ctl_context_t;
@@ -209,7 +210,7 @@ static void ff_ctl_device_event(struct work_struct *ws)
     FF_LOGV("'%s' enter.", __func__);
     
     FF_LOGD("%s(irq = %d, ..) toggled.", __func__, ctx->irq_num);
-    __pm_wakeup_event(&g_context->wakeup_source, 2 * HZ); // 2 seconds.
+    __pm_wakeup_event(g_context->wake_lock, 2 * HZ); // 2 seconds.
     kobject_uevent_env(&ctx->miscdev.this_device->kobj, KOBJ_CHANGE, uevent_env);
 
     FF_LOGV("'%s' leave.", __func__);
@@ -662,7 +663,7 @@ static int __init ff_ctl_driver_init(void)
     INIT_WORK(&ff_ctl_context.work_queue, ff_ctl_device_event);
 
     /* Init the wake lock. */
-    wakeup_source_init(&ff_ctl_context.wakeup_source, "ff_wakeup_source");
+    ff_ctl_context.wake_lock = wakeup_source_register(NULL, "ff_wake_lock");
 
     /* Assign the context instance. */
     g_context = &ff_ctl_context;
@@ -692,7 +693,7 @@ static void __exit ff_ctl_driver_exit(void)
     }
 
     /* De-init the wake lock. */
-    wakeup_source_trash(&g_context->wakeup_source);
+    wakeup_source_unregister(g_context->wake_lock);
 
     /* Unregister the miscellaneous device. */
     misc_deregister(&g_context->miscdev);
