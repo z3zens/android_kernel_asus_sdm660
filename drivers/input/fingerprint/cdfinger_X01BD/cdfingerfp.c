@@ -135,7 +135,7 @@ struct cdfingerfp_data {
 	struct regulator *vdd;
 #endif	
 	struct fasync_struct *async_queue;
-	struct wakeup_source cdfinger_lock;
+	struct wakeup_source *cdfinger_lock;
 	struct notifier_block notifier;
 	struct mutex buf_lock;
 	struct input_dev* cdfinger_input;
@@ -374,7 +374,7 @@ static irqreturn_t cdfinger_eint_handler(int irq, void *dev_id)
 	struct cdfingerfp_data *pdata = g_cdfingerfp_data;
 	if (pdata->irq_enable_status == 1)
 	{
-		__pm_wakeup_event(&pdata->cdfinger_lock, CDFINGER_HOLD_TIME);
+		__pm_wakeup_event(pdata->cdfinger_lock, CDFINGER_HOLD_TIME);
 		cdfinger_async_report();
 	}
 	return IRQ_HANDLED;
@@ -684,7 +684,7 @@ static int cdfinger_probe(struct platform_device *pdev)
 	}
 	cdfingerdev->miscdev = &st_cdfinger_dev;
 	mutex_init(&cdfingerdev->buf_lock);
-	wakeup_source_init(&cdfingerdev->cdfinger_lock, "cdfinger wakesrc");
+	cdfingerdev->cdfinger_lock = wakeup_source_register(NULL, "cdfinger wakelock");
 
 	cdfingerdev->cdfinger_input = input_allocate_device();
 	if(!cdfingerdev->cdfinger_input){
